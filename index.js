@@ -3,20 +3,15 @@ const { StringSession } = require("telegram/sessions");
 const { NewMessage } = require("telegram/events");
 const Redis = require("ioredis");
 
-// --- Configuration via Environment Variables ---
 const API_ID = parseInt(process.env.TELEGRAM_API_ID);
 const API_HASH = process.env.TELEGRAM_API_HASH;
 const STRING_SESSION = new StringSession(process.env.TELEGRAM_STRING_SESSION);
 
-// Parse the target rooms (handles spaces and commas gracefully)
 const TARGET_ROOMS = process.env.TARGET_ROOM_IDS.split(',').map(s => Number(s.trim()));
 const SUPABASE_EDGE_URL = process.env.SUPABASE_EDGE_URL;
 const RERAISE_EDGE_SECRET = process.env.RERAISE_EDGE_SECRET;
 
-// Hardened Base58 Regex with Word Boundaries (\b)
 const SOLANA_CA_REGEX = /\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/g;
-
-// Initialize Redis
 const redis = new Redis(process.env.REDIS_URL);
 
 (async () => {
@@ -26,26 +21,30 @@ const redis = new Redis(process.env.REDIS_URL);
 
   client.addEventHandler(async (event) => {
     const messageText = event.message.message;
+    if (!messageText) return;
     
-    // Telegram API usually returns the ID without the -100 prefix in this context
-    const chatId = event.message.peerId?.channelId;
-    if (!chatId) return;
-    
-    const fullId = Number(`-100${chatId}`);
+    // Dynamically handle both Basic Groups and Supergroups/Channels
+    let fullId;
+    if (event.message.peerId?.channelId) {
+      fullId = Number(`-100${event.message.peerId.channelId}`);
+    } else if (event.message.peerId?.chatId) {
+      fullId = Number(`-${event.message.peerId.chatId}`);
+    } else {
+      return; // Ignore Direct Messages
+    }
 
     if (TARGET_ROOMS.includes(fullId)) {
-      const foundCAs = messageText?.match(SOLANA_CA_REGEX);
+      const foundCAs = messageText.match(SOLANA_CA_REGEX);
       
       if (foundCAs) {
         const contractAddress = foundCAs[0];
         
-        // Fetch room name dynamically
         let roomName = "Alpha Room";
         try {
           const chatEntity = await client.getEntity(event.message.peerId);
           roomName = chatEntity.title || roomName;
         } catch (e) {
-          console.warn("Could not fetch room name, defaulting to 'Alpha Room'");
+          console.warn("Could not fetch room name");
         }
 
         const payload = {
@@ -59,7 +58,7 @@ const redis = new Redis(process.env.REDIS_URL);
         console.log(`🚨 Alpha Call Detected: ${contractAddress} in ${roomName}`);
 
         // 1. HOT PATH: Redis Broadcast
-        redis.publish('live_tape_stream', JSON.stringify(payload));
+        redis.publish('live_tape_stream', JSON.stringify(payload)).catch(e => console.error("Redis Error:", e));
 
         // 2. COLD PATH: Secure Post to Supabase
         fetch(SUPABASE_EDGE_URL, {
