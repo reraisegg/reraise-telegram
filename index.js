@@ -29,11 +29,8 @@ const redis = new Redis(process.env.REDIS_URL);
     } else if (event.message.peerId?.chatId) {
       fullId = Number(`-${event.message.peerId.chatId}`);
     } else if (event.message.peerId?.userId) {
-      fullId = Number(event.message.peerId.userId); // Catches DMs just in case
+      fullId = Number(event.message.peerId.userId); 
     }
-
-    // 🚨 THE X-RAY VISION LINE: Prints every message it sees to the logs
-    console.log(`[DEBUG] Heard message in Room ID: ${fullId} | Text: ${messageText}`);
 
     if (TARGET_ROOMS.includes(fullId)) {
       const foundCAs = messageText.match(SOLANA_CA_REGEX);
@@ -42,11 +39,21 @@ const redis = new Redis(process.env.REDIS_URL);
         const contractAddress = foundCAs[0];
         
         let roomName = "Alpha Room";
+        let avatarData = null; // Default to null if no avatar exists
+
         try {
+          // 1. Get the Room info
           const chatEntity = await client.getEntity(event.message.peerId);
           roomName = chatEntity.title || "Private Chat";
+
+          // 2. Fetch the Avatar image
+          const photoBuffer = await client.downloadProfilePhoto(chatEntity);
+          if (photoBuffer && photoBuffer.length > 0) {
+            // Convert the raw image bytes into a web-ready Base64 string
+            avatarData = `data:image/jpeg;base64,${photoBuffer.toString('base64')}`;
+          }
         } catch (e) {
-          console.warn("Could not fetch room name");
+          console.warn("Could not fetch room name or avatar");
         }
 
         const payload = {
@@ -54,15 +61,16 @@ const redis = new Redis(process.env.REDIS_URL);
           token_mint: contractAddress,
           room_name: roomName,
           room_id: fullId,
+          room_avatar: avatarData, // Passes the image directly to your React app
           timestamp: Date.now()
         };
 
         console.log(`🚨 Alpha Call Detected: ${contractAddress} in ${roomName}`);
 
-        // 1. HOT PATH: Redis Broadcast
+        // Broadcast to React
         redis.publish('live_tape_stream', JSON.stringify(payload)).catch(e => console.error("Redis Error:", e));
 
-        // 2. COLD PATH: Secure Post to Supabase
+        // Save to Database
         fetch(SUPABASE_EDGE_URL, {
           method: 'POST',
           headers: { 
