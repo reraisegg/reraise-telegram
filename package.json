@@ -12,6 +12,7 @@
   "type": "commonjs",
   "dependencies": {
     "input": "^1.0.1",
+    "ioredis": "^5.10.0",
     "telegram": "^2.26.22"
   }
 }
