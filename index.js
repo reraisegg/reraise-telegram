@@ -23,15 +23,17 @@ const redis = new Redis(process.env.REDIS_URL);
     const messageText = event.message.message;
     if (!messageText) return;
     
-    // Dynamically handle both Basic Groups and Supergroups/Channels
     let fullId;
     if (event.message.peerId?.channelId) {
       fullId = Number(`-100${event.message.peerId.channelId}`);
     } else if (event.message.peerId?.chatId) {
       fullId = Number(`-${event.message.peerId.chatId}`);
-    } else {
-      return; // Ignore Direct Messages
+    } else if (event.message.peerId?.userId) {
+      fullId = Number(event.message.peerId.userId); // Catches DMs just in case
     }
+
+    // 🚨 THE X-RAY VISION LINE: Prints every message it sees to the logs
+    console.log(`[DEBUG] Heard message in Room ID: ${fullId} | Text: ${messageText}`);
 
     if (TARGET_ROOMS.includes(fullId)) {
       const foundCAs = messageText.match(SOLANA_CA_REGEX);
@@ -42,7 +44,7 @@ const redis = new Redis(process.env.REDIS_URL);
         let roomName = "Alpha Room";
         try {
           const chatEntity = await client.getEntity(event.message.peerId);
-          roomName = chatEntity.title || roomName;
+          roomName = chatEntity.title || "Private Chat";
         } catch (e) {
           console.warn("Could not fetch room name");
         }
