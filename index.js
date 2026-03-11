@@ -115,7 +115,7 @@ async function getRoomName(client, peerId) {
     }
 
     // No CA + news room → telegram news
-    if (!foundCAs && isNewsRoom && messageText && messageText.trim().length > 0) {
+    if (isNewsRoom && messageText && messageText.trim().length > 0) {
       const roomName = await getRoomName(client, event.message.peerId);
       const roomAvatar = await getRoomAvatar(client, event.message.peerId, fullId);
 
