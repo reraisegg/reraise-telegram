@@ -108,6 +108,12 @@ async function validateRooms(client) {
   console.log(`   Target rooms: ${JSON.stringify(TARGET_ROOMS)}`);
   console.log(`   News rooms:   ${JSON.stringify(NEWS_ROOMS)}`);
 
+  // Force GramJS to hydrate internal channel state (pts)
+  // Without this, updates from unhydrated channels are silently dropped
+  console.log("📡 Hydrating channel state...");
+  const dialogs = await client.getDialogs({ limit: 200 });
+  console.log(`📡 Hydrated ${dialogs.length} dialogs — updates now active for all joined channels`);
+
   // Validate all rooms on startup
   await validateRooms(client);
 
