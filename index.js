@@ -1,7 +1,7 @@
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { NewMessage } = require("telegram/events");
-const { Raw } = require("telegram/events");
+
 const Redis = require("ioredis");
 
 // --- Configuration via Environment Variables ---
@@ -259,7 +259,7 @@ async function validateRooms(client) {
     } catch (err) {
       console.error("💥 Raw handler error:", err);
     }
-  }, new Raw());
+  });
 
   // --- Interest Keepalive: Prevent Telegram from throttling broadcast channel updates ---
   if (NEWS_ROOMS.length > 0) {
