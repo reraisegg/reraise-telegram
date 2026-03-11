@@ -122,6 +122,7 @@ async function validateRooms(client) {
       const isTargetRoom = TARGET_ROOMS.includes(fullId);
       const isNewsRoom = NEWS_ROOMS.includes(fullId);
 
+      // Skip untracked rooms (since we listen to all messages now)
       if (!isTargetRoom && !isNewsRoom) return;
 
       const messageText = extractMessageText(msg);
@@ -201,7 +202,7 @@ async function validateRooms(client) {
     } catch (err) {
       console.error("💥 Event handler error:", err);
     }
-  }, new NewMessage({ chats: ALL_TRACKED_IDS }));
+  }, new NewMessage({}));
 
-  console.log(`👂 Listening explicitly on ${ALL_TRACKED_IDS.length} chat(s)`);
+  console.log(`👂 Listening on ALL chats, filtering for ${ALL_TRACKED_IDS.length} tracked ID(s)`);
 })();
