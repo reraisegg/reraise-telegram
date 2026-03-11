@@ -18,6 +18,33 @@ const RERAISE_EDGE_SECRET = process.env.RERAISE_EDGE_SECRET;
 
 const ALL_TRACKED_IDS = [...new Set([...TARGET_ROOMS, ...NEWS_ROOMS])];
 
+// --- Startup environment validation ---
+function validateEnv() {
+  console.log("🔧 Environment validation:");
+
+  // Check for NaN in room IDs
+  const badTargets = TARGET_ROOMS.filter(id => isNaN(id));
+  const badNews = NEWS_ROOMS.filter(id => isNaN(id));
+  if (badTargets.length) console.error(`  ❌ TARGET_ROOM_IDS contains NaN values: ${JSON.stringify(badTargets)}`);
+  if (badNews.length) console.error(`  ❌ NEWS_ROOM_IDS contains NaN values: ${JSON.stringify(badNews)}`);
+
+  console.log(`  📋 TARGET_ROOMS (${TARGET_ROOMS.length}): ${JSON.stringify(TARGET_ROOMS)}`);
+  console.log(`  📋 NEWS_ROOMS   (${NEWS_ROOMS.length}): ${JSON.stringify(NEWS_ROOMS)}`);
+
+  if (!SUPABASE_EDGE_URL) console.error("  ❌ SUPABASE_EDGE_URL is missing!");
+  else console.log(`  ✅ SUPABASE_EDGE_URL: ${SUPABASE_EDGE_URL}`);
+
+  if (!SUPABASE_EDGE_URL_NEWS) console.error("  ❌ SUPABASE_EDGE_URL_NEWS is missing!");
+  else console.log(`  ✅ SUPABASE_EDGE_URL_NEWS: ${SUPABASE_EDGE_URL_NEWS}`);
+
+  if (!RERAISE_EDGE_SECRET) console.error("  ❌ RERAISE_EDGE_SECRET is missing!");
+  else console.log(`  ✅ RERAISE_EDGE_SECRET: set (${RERAISE_EDGE_SECRET.length} chars)`);
+
+  if (badTargets.length || badNews.length || !SUPABASE_EDGE_URL_NEWS || !RERAISE_EDGE_SECRET) {
+    console.error("🛑 Critical env vars missing or invalid — scraper may not function correctly");
+  }
+}
+
 // Hardened Base58 Regex
 const SOLANA_CA_REGEX = /\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/g;
 
@@ -30,18 +57,13 @@ redis.on('reconnecting', () => console.warn('🟡 Redis reconnecting...'));
 const avatarCache = new Map();
 
 // --- Deduplication ---
-// Prevents double-processing when both NewMessage and Raw handler fire for the same message
 const processedMsgIds = new Set();
 const DEDUP_MAX_SIZE = 5000;
 
 function isDuplicate(msgId) {
   if (processedMsgIds.has(msgId)) return true;
   processedMsgIds.add(msgId);
-  // Evict oldest entries when set grows too large
   if (processedMsgIds.size > DEDUP_MAX_SIZE) {
-    const iter = processedMsgIds.values();
-    for (let i = 0; i < 1000; i++) iter.next();
-    // Rebuild with recent entries only
     const recent = [...processedMsgIds].slice(-3000);
     processedMsgIds.clear();
     recent.forEach(id => processedMsgIds.add(id));
@@ -154,6 +176,8 @@ async function routeMessage(client, msg, source) {
         'x-api-key': RERAISE_EDGE_SECRET
       },
       body: JSON.stringify(payload)
+    }).then(res => {
+      if (!res.ok) res.text().then(t => console.error(`❌ Edge POST failed (alpha): ${res.status} ${t.substring(0, 200)}`));
     }).catch(e => console.error("❌ DB Sync Error (alpha):", e.message));
 
     return;
@@ -184,6 +208,9 @@ async function routeMessage(client, msg, source) {
         'x-api-key': RERAISE_EDGE_SECRET
       },
       body: JSON.stringify(payload)
+    }).then(res => {
+      if (!res.ok) res.text().then(t => console.error(`❌ Edge POST failed (news): ${res.status} ${t.substring(0, 200)}`));
+      else console.log(`✅ Edge POST success (news): ${res.status}`);
     }).catch(e => console.error("❌ DB Sync Error (news):", e.message));
 
     return;
@@ -195,6 +222,39 @@ async function routeMessage(client, msg, source) {
   } else {
     console.log(`⏭️ [${source}] DROP:no_route | room=${fullId} target=${isTargetRoom} news=${isNewsRoom} CAs=${foundCAs ? foundCAs.length : 0}`);
   }
+}
+
+// --- Extract message updates from any update envelope ---
+function extractMessageUpdates(update) {
+  const className = update.className;
+
+  // Direct message updates
+  if (className === 'UpdateNewChannelMessage' || className === 'UpdateNewMessage') {
+    return [update];
+  }
+
+  // Container updates (Updates, UpdatesCombined) — iterate nested updates array
+  if (className === 'Updates' || className === 'UpdatesCombined') {
+    const nested = update.updates || [];
+    const msgUpdates = nested.filter(u =>
+      u.className === 'UpdateNewChannelMessage' || u.className === 'UpdateNewMessage'
+    );
+    if (msgUpdates.length > 0) {
+      console.log(`📦 [RAW] Container ${className} → ${nested.length} nested, ${msgUpdates.length} message update(s)`);
+    }
+    return msgUpdates;
+  }
+
+  // UpdateShort with message
+  if (className === 'UpdateShort' && update.update) {
+    const inner = update.update;
+    if (inner.className === 'UpdateNewChannelMessage' || inner.className === 'UpdateNewMessage') {
+      console.log(`📦 [RAW] UpdateShort → unwrapped ${inner.className}`);
+      return [inner];
+    }
+  }
+
+  return [];
 }
 
 // --- Startup validation ---
@@ -215,6 +275,9 @@ async function validateRooms(client) {
 
 // --- Main ---
 (async () => {
+  // Validate environment before connecting
+  validateEnv();
+
   const client = new TelegramClient(STRING_SESSION, API_ID, API_HASH, {
     connectionRetries: 5,
     autoReconnect: true,
@@ -222,8 +285,6 @@ async function validateRooms(client) {
 
   await client.connect();
   console.log("🟢 Reraise Scraper Online");
-  console.log(`   Target rooms: ${JSON.stringify(TARGET_ROOMS)}`);
-  console.log(`   News rooms:   ${JSON.stringify(NEWS_ROOMS)}`);
 
   // Force GramJS to hydrate internal channel state (pts)
   console.log("📡 Hydrating channel state...");
@@ -252,10 +313,12 @@ async function validateRooms(client) {
   // --- Handler 2: Raw update handler (catches broadcast channel messages that NewMessage drops) ---
   client.addEventHandler(async (update) => {
     try {
-      if (update.className !== 'UpdateNewChannelMessage' && update.className !== 'UpdateNewMessage') return;
-      const msg = update.message;
-      if (!msg || !msg.peerId) return;
-      await routeMessage(client, msg, 'RAW');
+      const msgUpdates = extractMessageUpdates(update);
+      for (const u of msgUpdates) {
+        const msg = u.message;
+        if (!msg || !msg.peerId) continue;
+        await routeMessage(client, msg, 'RAW');
+      }
     } catch (err) {
       console.error("💥 Raw handler error:", err);
     }
@@ -277,4 +340,3 @@ async function validateRooms(client) {
 
   console.log(`👂 Listening via NewMessage + Raw handler, filtering for ${ALL_TRACKED_IDS.length} tracked ID(s)`);
 })();
-
