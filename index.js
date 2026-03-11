@@ -37,8 +37,14 @@ function extractMessageText(message) {
   return text.trim();
 }
 
-/** Resolve a peerId to a full numeric chat ID (with -100 prefix for channels) */
-function resolvePeerId(peerId) {
+/** Resolve message to a full numeric chat ID (with -100 prefix) safely */
+function resolvePeerId(msg) {
+  // Primary: GramJS native chatId (BigInt, already -100 prefixed for channels)
+  if (msg.chatId) {
+    return Number(msg.chatId.toString());
+  }
+  // Fallback: manual peerId parsing
+  const peerId = msg.peerId;
   if (!peerId) return null;
   if (peerId.channelId) return Number(`-100${peerId.channelId}`);
   if (peerId.chatId) return Number(`-${peerId.chatId}`);
@@ -115,9 +121,12 @@ async function validateRooms(client) {
   client.addEventHandler(async (event) => {
     try {
       const msg = event.message;
-      const fullId = resolvePeerId(msg.peerId);
+      const fullId = resolvePeerId(msg);
 
-      if (!fullId) return;
+      if (!fullId) {
+        console.log(`⏭️ DROP:no_id | peerId=${JSON.stringify(msg.peerId)} chatId=${msg.chatId}`);
+        return;
+      }
 
       const isTargetRoom = TARGET_ROOMS.includes(fullId);
       const isNewsRoom = NEWS_ROOMS.includes(fullId);
