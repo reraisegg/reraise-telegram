@@ -39,16 +39,20 @@ function extractMessageText(message) {
 
 /** Resolve message to a full numeric chat ID (with -100 prefix) safely */
 function resolvePeerId(msg) {
-  // Primary: GramJS native chatId (BigInt, already -100 prefixed for channels)
-  if (msg.chatId) {
-    return Number(msg.chatId.toString());
-  }
-  // Fallback: manual peerId parsing
+  // Try peerId first — it has explicit type info (channelId vs chatId vs userId)
   const peerId = msg.peerId;
-  if (!peerId) return null;
-  if (peerId.channelId) return Number(`-100${peerId.channelId}`);
-  if (peerId.chatId) return Number(`-${peerId.chatId}`);
-  if (peerId.userId) return Number(peerId.userId);
+  if (peerId) {
+    if (peerId.channelId) return Number(`-100${peerId.channelId}`);
+    if (peerId.chatId) return Number(`-${peerId.chatId}`);
+    if (peerId.userId) return Number(peerId.userId);
+  }
+  // Fallback: msg.chatId (BigInt) — may or may not have -100 prefix
+  if (msg.chatId) {
+    const id = Number(msg.chatId.toString());
+    // If positive, it's a raw channel ID — add -100 prefix
+    if (id > 0) return Number(`-100${id}`);
+    return id;
+  }
   return null;
 }
 
@@ -124,9 +128,17 @@ async function validateRooms(client) {
     }
   });
 
+  let debugCount = 0;
   client.addEventHandler(async (event) => {
     try {
       const msg = event.message;
+
+      // Temporary: log raw data for first 5 messages to confirm ID format
+      if (debugCount < 5) {
+        debugCount++;
+        console.log(`🔬 RAW[${debugCount}] | chatId=${msg.chatId} peerId=${JSON.stringify(msg.peerId)} className=${msg.className}`);
+      }
+
       const fullId = resolvePeerId(msg);
 
       if (!fullId) {
@@ -138,7 +150,10 @@ async function validateRooms(client) {
       const isNewsRoom = NEWS_ROOMS.includes(fullId);
 
       // Skip untracked rooms (since we listen to all messages now)
-      if (!isTargetRoom && !isNewsRoom) return;
+      if (!isTargetRoom && !isNewsRoom) {
+        console.log(`⏭️ SKIP:untracked | fullId=${fullId} chatId=${msg.chatId} peerId=${JSON.stringify(msg.peerId)}`);
+        return;
+      }
 
       const messageText = extractMessageText(msg);
       const hasMedia = !!msg.media;
