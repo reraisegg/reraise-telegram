@@ -288,8 +288,19 @@ async function validateRooms(client) {
 
   // Force GramJS to hydrate internal channel state (pts)
   console.log("📡 Hydrating channel state...");
-  const dialogs = await client.getDialogs({ limit: 200 });
+  const dialogs = await client.getDialogs({ limit: 500 });
   console.log(`📡 Hydrated ${dialogs.length} dialogs — updates now active for all joined channels`);
+
+  // Force entity hydration for ALL tracked rooms (critical for broadcast channels)
+  console.log("🔑 Force-hydrating entity cache for all tracked rooms...");
+  for (const roomId of ALL_TRACKED_IDS) {
+    try {
+      await client.getInputEntity(roomId);
+      console.log(`  ✅ Hydrated entity for ${roomId}`);
+    } catch (e) {
+      console.error(`  ❌ Failed to hydrate entity for ${roomId}: ${e.message}`);
+    }
+  }
 
   // Validate all rooms on startup
   await validateRooms(client);
@@ -311,8 +322,13 @@ async function validateRooms(client) {
   }, new NewMessage({}));
 
   // --- Handler 2: Raw update handler (catches broadcast channel messages that NewMessage drops) ---
+  const NOISY_UPDATES = new Set(['UpdateReadChannelInbox', 'UpdateReadHistoryInbox', 'UpdateUserStatus', 'UpdateChannelReadMessagesContents', 'UpdateReadChannelDiscussionInbox', 'UpdateDeleteChannelMessages', 'UpdateEditChannelMessage', 'UpdateEditMessage', 'UpdateMessagePoll', 'UpdateMessagePollVote', 'UpdateDraftMessage', 'UpdateWebPage', 'UpdateNotifySettings', 'UpdatePeerSettings', 'UpdateMessageReactions']);
   client.addEventHandler(async (update) => {
     try {
+      // Diagnostic: log non-noisy update classNames
+      if (update.className && !NOISY_UPDATES.has(update.className)) {
+        console.log(`🔍 [RAW] Received: ${update.className}`);
+      }
       const msgUpdates = extractMessageUpdates(update);
       for (const u of msgUpdates) {
         const msg = u.message;
