@@ -56,6 +56,9 @@ redis.on('reconnecting', () => console.warn('🟡 Redis reconnecting...'));
 // Avatar cache
 const avatarCache = new Map();
 
+// News entity cache: roomId → resolved InputPeer (avoids AUTH_KEY_DUPLICATED)
+const newsEntityCache = new Map();
+
 // Poll fallback: track last seen message ID per news room
 const lastSeenNewsId = new Map();
 
@@ -308,11 +311,24 @@ async function validateRooms(client) {
   // Validate all rooms on startup
   await validateRooms(client);
 
+  // Cache resolved InputPeer entities for news rooms (prevents AUTH_KEY_DUPLICATED)
+  console.log("🔑 Caching InputPeer entities for news rooms...");
+  for (const roomId of NEWS_ROOMS) {
+    try {
+      const entity = await client.getInputEntity(roomId);
+      newsEntityCache.set(roomId, entity);
+      console.log(`  ✅ Cached InputPeer for news room ${roomId}`);
+    } catch (e) {
+      console.error(`  ❌ Failed to cache InputPeer for ${roomId}: ${e.message}`);
+    }
+  }
+
   // Seed lastSeenNewsId so poll fallback only processes future messages
   console.log("📌 Seeding lastSeenNewsId for news rooms...");
   for (const roomId of NEWS_ROOMS) {
     try {
-      const msgs = await client.getMessages(roomId, { limit: 1 });
+      const peer = newsEntityCache.get(roomId) || roomId;
+      const msgs = await client.getMessages(peer, { limit: 1 });
       if (msgs.length > 0) {
         lastSeenNewsId.set(roomId, msgs[0].id);
         console.log(`  📌 Seeded lastSeenNewsId for ${roomId}: ${msgs[0].id}`);
@@ -363,7 +379,8 @@ async function validateRooms(client) {
     setInterval(async () => {
       for (const roomId of NEWS_ROOMS) {
         try {
-          const msgs = await client.getMessages(roomId, { limit: 5 });
+        const peer = newsEntityCache.get(roomId) || roomId;
+        const msgs = await client.getMessages(peer, { limit: 5 });
           const lastSeen = lastSeenNewsId.get(roomId) || 0;
           const newMsgs = msgs.filter(m => m.id > lastSeen);
           if (newMsgs.length > 0) {
