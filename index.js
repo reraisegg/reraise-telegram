@@ -9,6 +9,15 @@ process.on('unhandledRejection', (reason) => {
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`⏰ ${label} timed out after ${ms / 1000}s`)), ms)
+    ),
+  ]);
+}
+
 const Redis = require("ioredis");
 
 // --- Configuration via Environment Variables ---
@@ -68,8 +77,8 @@ const redis = new Redis(process.env.REDIS_URL);
 redis.on('error', (err) => console.error('🔴 Redis error:', err.message));
 redis.on('reconnecting', () => console.warn('🟡 Redis reconnecting...'));
 
-// Avatar cache
-const avatarCache = new Map();
+// Unified room metadata cache: roomId → { name, avatar }
+const roomMetaCache = new Map();
 
 // News entity cache: roomId → resolved InputPeer (avoids AUTH_KEY_DUPLICATED)
 const newsEntityCache = new Map();
@@ -116,32 +125,28 @@ function resolvePeerId(msg) {
   return null;
 }
 
-async function getRoomAvatar(client, peerId, roomId) {
-  if (avatarCache.has(roomId)) return avatarCache.get(roomId);
-  let avatar = null;
+/** Fetch and cache room metadata (name + avatar) in a single getEntity call */
+async function getRoomMeta(client, peerId, roomId) {
+  if (roomMetaCache.has(roomId)) return roomMetaCache.get(roomId);
+  let meta = { name: 'Alpha Room', avatar: null };
   try {
-    const chatEntity = await client.getEntity(peerId);
+    const chatEntity = await withTimeout(client.getEntity(peerId), 10000, `getEntity(${roomId})`);
+    meta.name = chatEntity.title || 'Alpha Room';
     if (chatEntity.photo) {
-      const buffer = await client.downloadProfilePhoto(chatEntity, { isBig: false });
-      if (buffer) {
-        avatar = `data:image/jpeg;base64,${buffer.toString('base64')}`;
+      try {
+        const buffer = await withTimeout(client.downloadProfilePhoto(chatEntity, { isBig: false }), 10000, `downloadPhoto(${roomId})`);
+        if (buffer) {
+          meta.avatar = `data:image/jpeg;base64,${buffer.toString('base64')}`;
+        }
+      } catch (e) {
+        console.warn(`⚠️ Avatar download failed for ${roomId}:`, e.message);
       }
     }
   } catch (e) {
-    console.warn(`⚠️ Avatar fetch failed for room ${roomId}:`, e.message);
+    console.warn(`⚠️ Room meta fetch failed for ${roomId}:`, e.message);
   }
-  avatarCache.set(roomId, avatar);
-  return avatar;
-}
-
-async function getRoomName(client, peerId) {
-  try {
-    const chatEntity = await client.getEntity(peerId);
-    return chatEntity.title || "Alpha Room";
-  } catch (e) {
-    console.warn("⚠️ Room name fetch failed, using default");
-    return "Alpha Room";
-  }
+  roomMetaCache.set(roomId, meta);
+  return meta;
 }
 
 // --- Core message routing logic (shared by both handlers) ---
@@ -174,8 +179,7 @@ async function routeMessage(client, msg, source) {
   // CA-first routing: CA found in a target room → alpha call
   if (foundCAs && isTargetRoom) {
     const contractAddress = foundCAs[0];
-    const roomName = await getRoomName(client, msg.peerId);
-    const roomAvatar = await getRoomAvatar(client, msg.peerId, fullId);
+    const { name: roomName, avatar: roomAvatar } = await getRoomMeta(client, msg.peerId, fullId);
 
     const payload = {
       type: 'alpha_call',
@@ -188,7 +192,7 @@ async function routeMessage(client, msg, source) {
 
     console.log(`🚨 [${source}] ROUTE:alpha_call | CA=${contractAddress} room="${roomName}"`);
 
-    redis.publish('live_tape_stream', JSON.stringify(payload));
+    try { redis.publish('live_tape_stream', JSON.stringify(payload)); } catch (e) { console.error('Redis publish failed:', e.message); }
 
     fetch(SUPABASE_EDGE_URL, {
       method: 'POST',
@@ -206,8 +210,7 @@ async function routeMessage(client, msg, source) {
 
   // News routing: news room + has text
   if (isNewsRoom && messageText.length > 0) {
-    const roomName = await getRoomName(client, msg.peerId);
-    const roomAvatar = await getRoomAvatar(client, msg.peerId, fullId);
+    const { name: roomName, avatar: roomAvatar } = await getRoomMeta(client, msg.peerId, fullId);
 
     const payload = {
       type: 'telegram_news',
@@ -220,7 +223,7 @@ async function routeMessage(client, msg, source) {
 
     console.log(`📰 [${source}] ROUTE:news | room="${roomName}" text="${messageText.substring(0, 80)}..."`);
 
-    redis.publish('live_tape_stream', JSON.stringify(payload));
+    try { redis.publish('live_tape_stream', JSON.stringify(payload)); } catch (e) { console.error('Redis publish failed:', e.message); }
 
     fetch(SUPABASE_EDGE_URL_NEWS, {
       method: 'POST',
@@ -275,6 +278,21 @@ function extractMessageUpdates(update) {
     }
   }
 
+  // UpdateShortMessage / UpdateShortChatMessage — compact format (good hygiene, low-risk)
+  if (className === 'UpdateShortMessage' || className === 'UpdateShortChatMessage') {
+    console.log(`📦 [RAW] ${className} → constructing synthetic message (id=${update.id})`);
+    return [{
+      message: {
+        id: update.id,
+        message: update.message,
+        peerId: update.peerId || (update.chatId ? { channelId: update.chatId } : undefined),
+        chatId: update.chatId,
+        media: null
+      },
+      className: 'UpdateNewChannelMessage'
+    }];
+  }
+
   return [];
 }
 
@@ -283,7 +301,7 @@ async function validateRooms(client) {
   console.log("🔍 Validating configured room IDs...");
   for (const roomId of ALL_TRACKED_IDS) {
     try {
-      const entity = await client.getEntity(roomId);
+      const entity = await withTimeout(client.getEntity(roomId), 10000, `validateRoom(${roomId})`);
       const title = entity.title || entity.username || 'unknown';
       const isTarget = TARGET_ROOMS.includes(roomId);
       const isNews = NEWS_ROOMS.includes(roomId);
@@ -324,16 +342,23 @@ async function validateRooms(client) {
     }
   }
 
-  // Force GramJS to hydrate internal channel state (pts)
+  // Force GramJS to hydrate internal channel state (pts) — graceful degradation
   console.log("📡 Hydrating channel state...");
-  const dialogs = await client.getDialogs({ limit: 500 });
-  console.log(`📡 Hydrated ${dialogs.length} dialogs — updates now active for all joined channels`);
+  let dialogHydrated = false;
+  try {
+    const dialogs = await withTimeout(client.getDialogs({ limit: 100 }), 30000, 'getDialogs');
+    console.log(`📡 Hydrated ${dialogs.length} dialogs — updates now active for all joined channels`);
+    dialogHydrated = true;
+  } catch (e) {
+    console.warn(`⚠️ getDialogs failed/timed out (non-fatal): ${e.message}`);
+  }
+  console.log(`📡 Startup mode: ${dialogHydrated ? 'full hydration' : 'poll-fallback-only (dialog hydration skipped)'}`);
 
   // Force entity hydration for ALL tracked rooms (critical for broadcast channels)
   console.log("🔑 Force-hydrating entity cache for all tracked rooms...");
   for (const roomId of ALL_TRACKED_IDS) {
     try {
-      await client.getInputEntity(roomId);
+      await withTimeout(client.getInputEntity(roomId), 10000, `getInputEntity(${roomId})`);
       console.log(`  ✅ Hydrated entity for ${roomId}`);
     } catch (e) {
       console.error(`  ❌ Failed to hydrate entity for ${roomId}: ${e.message}`);
@@ -352,7 +377,7 @@ async function validateRooms(client) {
   console.log("🔑 Caching InputPeer entities for news rooms...");
   for (const roomId of NEWS_ROOMS) {
     try {
-      const entity = await client.getInputEntity(roomId);
+      const entity = await withTimeout(client.getInputEntity(roomId), 10000, `getInputEntity(news:${roomId})`);
       newsEntityCache.set(roomId, entity);
       console.log(`  ✅ Cached InputPeer for news room ${roomId}`);
     } catch (e) {
@@ -366,7 +391,7 @@ async function validateRooms(client) {
   for (const roomId of NEWS_ROOMS) {
     try {
       const peer = newsEntityCache.get(roomId) || roomId;
-      const msgs = await client.getMessages(peer, { limit: 1 });
+      const msgs = await withTimeout(client.getMessages(peer, { limit: 1 }), 10000, `getMessages(seed:${roomId})`);
       if (msgs.length > 0) {
         lastSeenNewsId.set(roomId, msgs[0].id);
         console.log(`  📌 Seeded lastSeenNewsId for ${roomId}: ${msgs[0].id}`);
@@ -377,7 +402,7 @@ async function validateRooms(client) {
       await delay(2000);
       try {
         const peer = newsEntityCache.get(roomId) || roomId;
-        const msgs = await client.getMessages(peer, { limit: 1 });
+        const msgs = await withTimeout(client.getMessages(peer, { limit: 1 }), 10000, `getMessages(seed-retry:${roomId})`);
         if (msgs.length > 0) {
           lastSeenNewsId.set(roomId, msgs[0].id);
           console.log(`  📌 Seeded lastSeenNewsId for ${roomId} (retry): ${msgs[0].id}`);
@@ -439,14 +464,15 @@ async function validateRooms(client) {
           const newMsgs = msgs.filter(m => m.id > lastSeen);
           newMsgs.sort((a, b) => a.id - b.id); // oldest first — chronological routing
 
+          // Set lastSeenNewsId BEFORE routing to prevent race condition
+          if (msgs.length > 0) {
+            lastSeenNewsId.set(roomId, Math.max(...msgs.map(m => m.id)));
+          }
           if (newMsgs.length > 0) {
             console.log(`📬 [POLL] ${newMsgs.length} new message(s) in room ${roomId} (lastSeen=${lastSeen})`);
           }
           for (const msg of newMsgs) {
             await routeMessage(client, msg, 'POLL');
-          }
-          if (msgs.length > 0) {
-            lastSeenNewsId.set(roomId, Math.max(...msgs.map(m => m.id)));
           }
           roomsChecked++;
           totalNewMsgs += newMsgs.length;
@@ -460,11 +486,12 @@ async function validateRooms(client) {
             const lastSeen = lastSeenNewsId.get(roomId) || 0;
             const newMsgs = msgs.filter(m => m.id > lastSeen);
             newMsgs.sort((a, b) => a.id - b.id); // oldest first
-            for (const msg of newMsgs) {
-              await routeMessage(client, msg, 'POLL');
-            }
+            // Set lastSeenNewsId BEFORE routing to prevent race condition
             if (msgs.length > 0) {
               lastSeenNewsId.set(roomId, Math.max(...msgs.map(m => m.id)));
+            }
+            for (const msg of newMsgs) {
+              await routeMessage(client, msg, 'POLL');
             }
             roomsChecked++;
             totalNewMsgs += newMsgs.length;
