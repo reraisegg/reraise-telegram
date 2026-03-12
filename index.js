@@ -296,6 +296,7 @@ async function validateRooms(client) {
 
 // --- Main ---
 (async () => {
+  try {
   // Validate environment before connecting
   validateEnv();
 
@@ -326,7 +327,11 @@ async function validateRooms(client) {
   }
 
   // Validate all rooms on startup
-  await validateRooms(client);
+  try {
+    await validateRooms(client);
+  } catch (e) {
+    console.error("⚠️ validateRooms failed (non-fatal):", e.message);
+  }
 
   // Cache resolved InputPeer entities for news rooms (prevents AUTH_KEY_DUPLICATED)
   console.log("🔑 Caching InputPeer entities for news rooms...");
@@ -459,5 +464,10 @@ async function validateRooms(client) {
     }, 10_000);
   }
 
+  console.log("🚀 Startup complete. Entering poll loop (10s interval)...");
   console.log(`👂 Listening via NewMessage + Raw handler, filtering for ${ALL_TRACKED_IDS.length} tracked ID(s)`);
+  } catch (err) {
+    console.error("💀 FATAL: Startup crashed:", err);
+    process.exit(1);
+  }
 })();
