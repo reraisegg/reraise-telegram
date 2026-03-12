@@ -1,6 +1,12 @@
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { NewMessage } = require("telegram/events");
+const crypto = require("crypto");
+
+// --- Startup Fingerprint ---
+const INSTANCE_ID = process.env.INSTANCE_ID || crypto.randomUUID().slice(0, 8);
+const BOOT_TIME = new Date().toISOString();
+console.log(`🆔 Instance: ${INSTANCE_ID} | PID: ${process.pid} | Boot: ${BOOT_TIME}`);
 
 // Global safety net — prevent transient MTProto errors from crashing the process
 process.on('unhandledRejection', (reason) => {
@@ -40,6 +46,36 @@ const SUPABASE_EDGE_URL_NEWS = process.env.SUPABASE_EDGE_URL_NEWS;
 const RERAISE_EDGE_SECRET = process.env.RERAISE_EDGE_SECRET;
 
 const ALL_TRACKED_IDS = [...new Set([...TARGET_ROOMS, ...NEWS_ROOMS])];
+
+// --- Shutdown state ---
+let isShuttingDown = false;
+let pollInterval = null;
+let lockRefreshInterval = null;
+let activeClient = null;
+
+// --- Redis Singleton Lock ---
+const LOCK_KEY = 'telegram_scraper_lock';
+const LOCK_TOKEN = `${INSTANCE_ID}:${process.pid}:${Date.now()}`;
+const LOCK_TTL = 90; // seconds
+const LOCK_REFRESH_INTERVAL = 30_000; // ms
+
+// Lua script: refresh lock only if we own it
+const REFRESH_LOCK_SCRIPT = `
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("expire", KEYS[1], ARGV[2])
+  else
+    return 0
+  end
+`;
+
+// Lua script: release lock only if we own it
+const RELEASE_LOCK_SCRIPT = `
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  else
+    return 0
+  end
+`;
 
 // --- Startup environment validation ---
 function validateEnv() {
@@ -101,6 +137,57 @@ function isDuplicate(msgId) {
   return false;
 }
 
+// --- Graceful Shutdown ---
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`\n🛑 ${signal} received — starting graceful shutdown...`);
+
+  // 1. Clear intervals
+  if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+  if (lockRefreshInterval) { clearInterval(lockRefreshInterval); lockRefreshInterval = null; }
+
+  // 2. Disconnect Telegram client with timeout
+  if (activeClient) {
+    try {
+      console.log('🔌 Disconnecting Telegram client...');
+      await withTimeout(activeClient.disconnect(), 10000, 'client.disconnect');
+      console.log('✅ Telegram client disconnected');
+    } catch (e) {
+      console.warn(`⚠️ Telegram disconnect failed: ${e.message}`);
+      try { activeClient.destroy(); } catch (_) {}
+    }
+  }
+
+  // 3. Release Redis lock
+  try {
+    const released = await withTimeout(
+      redis.eval(RELEASE_LOCK_SCRIPT, 1, LOCK_KEY, LOCK_TOKEN),
+      5000,
+      'releaseLock'
+    );
+    console.log(`🔓 Lock release: ${released ? 'released' : 'not held by us'}`);
+  } catch (e) {
+    console.warn(`⚠️ Lock release failed: ${e.message}`);
+  }
+
+  // 4. Quit Redis
+  try {
+    console.log('📤 Closing Redis connection...');
+    await withTimeout(redis.quit(), 5000, 'redis.quit');
+    console.log('✅ Redis disconnected');
+  } catch (e) {
+    console.warn(`⚠️ Redis quit failed: ${e.message}`);
+    try { redis.disconnect(); } catch (_) {}
+  }
+
+  console.log('👋 Shutdown complete. Exiting.');
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
 // --- Helpers ---
 
 /** Extract text from message, handling captions on media posts */
@@ -151,6 +238,8 @@ async function getRoomMeta(client, peerId, roomId) {
 
 // --- Core message routing logic (shared by both handlers) ---
 async function routeMessage(client, msg, source) {
+  if (isShuttingDown) return; // Don't route during shutdown
+
   const fullId = resolvePeerId(msg);
 
   if (!fullId) {
@@ -324,6 +413,32 @@ async function validateRooms(client) {
     useWSS: true,
     floodSleepThreshold: 60,
   });
+  activeClient = client;
+
+  // --- Acquire Redis singleton lock ---
+  console.log(`🔒 Acquiring scraper lock (key=${LOCK_KEY}, token=${LOCK_TOKEN})...`);
+  const lockAcquired = await redis.set(LOCK_KEY, LOCK_TOKEN, 'NX', 'EX', LOCK_TTL);
+  if (!lockAcquired) {
+    const currentHolder = await redis.get(LOCK_KEY);
+    console.error(`🛑 FATAL: Lock already held by: ${currentHolder}`);
+    console.error(`🛑 Another scraper instance is running. Exiting to prevent AUTH_KEY_DUPLICATED.`);
+    await redis.quit();
+    process.exit(1);
+  }
+  console.log(`🔒 Lock acquired successfully (TTL=${LOCK_TTL}s)`);
+
+  // Start lock heartbeat refresh
+  lockRefreshInterval = setInterval(async () => {
+    try {
+      const refreshed = await redis.eval(REFRESH_LOCK_SCRIPT, 1, LOCK_KEY, LOCK_TOKEN, LOCK_TTL);
+      if (!refreshed) {
+        console.error('🛑 Lock lost! Another instance may have taken over. Shutting down.');
+        gracefulShutdown('LOCK_LOST');
+      }
+    } catch (e) {
+      console.warn(`⚠️ Lock refresh failed: ${e.message}`);
+    }
+  }, LOCK_REFRESH_INTERVAL);
 
   // Retry connect with backoff to handle AUTH_KEY_DUPLICATED (406)
   for (let attempt = 1; attempt <= 5; attempt++) {
@@ -335,7 +450,10 @@ async function validateRooms(client) {
       const isAuthDupe = e.message?.includes('AUTH_KEY_DUPLICATED') || e.code === 406;
       if (isAuthDupe && attempt < 5) {
         const wait = attempt * 5;
-        console.warn(`⚠️ AUTH_KEY_DUPLICATED on attempt ${attempt}/5 — retrying in ${wait}s...`);
+        console.warn(`⚠️ AUTH_KEY_DUPLICATED on attempt ${attempt}/5 — disconnecting & retrying in ${wait}s...`);
+        // Force cleanup before retry
+        try { await withTimeout(client.disconnect(), 5000, 'disconnect-before-retry'); } catch (_) {}
+        try { client.destroy(); } catch (_) {}
         await delay(wait * 1000);
       } else {
         throw e;
@@ -349,9 +467,21 @@ async function validateRooms(client) {
     const me = await withTimeout(client.getMe(), 15000, 'getMe');
     console.log(`✅ Authenticated as: ${me.username || me.firstName} (id: ${me.id})`);
   } catch (e) {
-    console.error(`💀 FATAL: Cannot execute API calls — connection is broken: ${e.message}`);
-    console.error(`💀 Either the session needs regeneration or the network is blocking MTProto RPC.`);
-    process.exit(1);
+    console.warn(`⚠️ getMe failed: ${e.message} — attempting one reconnect cycle...`);
+    // One controlled reconnect before fatal exit
+    try {
+      await withTimeout(client.disconnect(), 5000, 'disconnect-for-reconnect');
+    } catch (_) {}
+    await delay(3000);
+    try {
+      await client.connect();
+      const me = await withTimeout(client.getMe(), 15000, 'getMe-retry');
+      console.log(`✅ Authenticated on retry: ${me.username || me.firstName} (id: ${me.id})`);
+    } catch (e2) {
+      console.error(`💀 FATAL: Cannot execute API calls after reconnect — connection is broken: ${e2.message}`);
+      console.error(`💀 Either the session needs regeneration or the network is blocking MTProto RPC.`);
+      await gracefulShutdown('FATAL_HEALTH_CHECK');
+    }
   }
 
   // Force GramJS to hydrate internal channel state (pts) — graceful degradation
@@ -464,11 +594,14 @@ async function validateRooms(client) {
   // --- Poll Fallback + Interest Keepalive for broadcast channel news ---
   if (NEWS_ROOMS.length > 0) {
     console.log(`🔄 Starting news poll fallback for ${NEWS_ROOMS.length} news room(s)`);
-    setInterval(async () => {
+    pollInterval = setInterval(async () => {
+      if (isShuttingDown) return;
+
       let roomsChecked = 0;
       let totalNewMsgs = 0;
 
       for (const roomId of NEWS_ROOMS) {
+        if (isShuttingDown) break;
         try {
           const peer = newsEntityCache.get(roomId) || roomId;
           const msgs = await client.getMessages(peer, { limit: 20 });
@@ -522,7 +655,10 @@ async function validateRooms(client) {
   console.log(`👂 Listening via NewMessage + Raw handler, filtering for ${ALL_TRACKED_IDS.length} tracked ID(s)`);
   } catch (err) {
     console.error("💀 FATAL: Startup crashed:", err);
-    try { await client.disconnect(); } catch (_) {}
+    try { await activeClient?.disconnect(); } catch (_) {}
+    // Release lock on crash
+    try { await redis.eval(RELEASE_LOCK_SCRIPT, 1, LOCK_KEY, LOCK_TOKEN); } catch (_) {}
+    try { await redis.quit(); } catch (_) {}
     process.exit(1);
   }
 })();
