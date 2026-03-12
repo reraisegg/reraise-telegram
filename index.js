@@ -3,10 +3,19 @@ const { StringSession } = require("telegram/sessions");
 const { NewMessage } = require("telegram/events");
 const crypto = require("crypto");
 
+// --- Forensic Diagnostics ---
+function sessionFingerprint(sessionStr) {
+  if (!sessionStr) return 'MISSING';
+  return crypto.createHash('sha256').update(sessionStr).digest('hex').slice(0, 12);
+}
+
 // --- Startup Fingerprint ---
 const INSTANCE_ID = process.env.INSTANCE_ID || crypto.randomUUID().slice(0, 8);
 const BOOT_TIME = new Date().toISOString();
+const SESSION_FP = sessionFingerprint(process.env.TELEGRAM_STRING_SESSION || '');
 console.log(`🆔 Instance: ${INSTANCE_ID} | PID: ${process.pid} | Boot: ${BOOT_TIME}`);
+console.log(`🔑 Session fingerprint: ${SESSION_FP}`);
+console.log(`🚂 Railway: project=${process.env.RAILWAY_PROJECT_ID || 'N/A'} service=${process.env.RAILWAY_SERVICE_NAME || 'N/A'} deploy=${process.env.RAILWAY_DEPLOYMENT_ID?.slice(0, 8) || 'N/A'}`);
 
 // Global safety net — prevent transient MTProto errors from crashing the process
 process.on('unhandledRejection', (reason) => {
@@ -29,14 +38,13 @@ const Redis = require("ioredis");
 // --- Configuration via Environment Variables ---
 const API_ID = parseInt(process.env.TELEGRAM_API_ID);
 const API_HASH = process.env.TELEGRAM_API_HASH;
-const STRING_SESSION = new StringSession(process.env.TELEGRAM_STRING_SESSION);
+const RAW_SESSION_STRING = process.env.TELEGRAM_STRING_SESSION;
 const TARGET_ROOMS = process.env.TARGET_ROOM_IDS.split(',').map(s => Number(s.trim()));
 const NEWS_ROOMS_RAW = process.env.NEWS_ROOM_IDS
   ? process.env.NEWS_ROOM_IDS.split(',').map(s => s.trim()).filter(Boolean)
   : [];
 const NEWS_ROOMS = NEWS_ROOMS_RAW.map(s => {
   const n = Number(s);
-  // Ensure every channel ID has the -100 prefix
   if (n > 0) return Number(`-100${n}`);
   if (n < 0 && !String(n).startsWith('-100')) return Number(`-100${String(n).slice(1)}`);
   return n;
@@ -58,6 +66,9 @@ const LOCK_KEY = 'telegram_scraper_lock';
 const LOCK_TOKEN = `${INSTANCE_ID}:${process.pid}:${Date.now()}`;
 const LOCK_TTL = 90; // seconds
 const LOCK_REFRESH_INTERVAL = 30_000; // ms
+
+// --- Bootstrap retry: slow backoff for AUTH_KEY_DUPLICATED ---
+const AUTH_DUPE_BACKOFFS_MS = [30_000, 60_000, 120_000]; // 3 attempts max
 
 // Lua script: refresh lock only if we own it
 const REFRESH_LOCK_SCRIPT = `
@@ -81,7 +92,6 @@ const RELEASE_LOCK_SCRIPT = `
 function validateEnv() {
   console.log("🔧 Environment validation:");
 
-  // Check for NaN in room IDs
   const badTargets = TARGET_ROOMS.filter(id => isNaN(id));
   const badNews = NEWS_ROOMS.filter(id => isNaN(id));
   if (badTargets.length) console.error(`  ❌ TARGET_ROOM_IDS contains NaN values: ${JSON.stringify(badTargets)}`);
@@ -116,7 +126,7 @@ redis.on('reconnecting', () => console.warn('🟡 Redis reconnecting...'));
 // Unified room metadata cache: roomId → { name, avatar }
 const roomMetaCache = new Map();
 
-// News entity cache: roomId → resolved InputPeer (avoids AUTH_KEY_DUPLICATED)
+// News entity cache: roomId → resolved InputPeer
 const newsEntityCache = new Map();
 
 // Poll fallback: track last seen message ID per news room
@@ -137,17 +147,45 @@ function isDuplicate(msgId) {
   return false;
 }
 
+// --- Forensic: log Redis + lock state on 406 ---
+async function log406Diagnostics(attemptNum) {
+  console.error(`🔬 [406 DIAGNOSTICS] attempt=${attemptNum} session_fp=${SESSION_FP}`);
+  console.error(`🔬 [406 DIAGNOSTICS] instance=${INSTANCE_ID} pid=${process.pid} boot=${BOOT_TIME}`);
+  console.error(`🔬 [406 DIAGNOSTICS] railway_deploy=${process.env.RAILWAY_DEPLOYMENT_ID || 'N/A'} railway_service=${process.env.RAILWAY_SERVICE_NAME || 'N/A'}`);
+  try {
+    const lockValue = await redis.get(LOCK_KEY);
+    const lockTTL = await redis.ttl(LOCK_KEY);
+    console.error(`🔬 [406 DIAGNOSTICS] lock_holder="${lockValue}" lock_ttl=${lockTTL}s our_token="${LOCK_TOKEN}"`);
+    console.error(`🔬 [406 DIAGNOSTICS] lock_is_ours=${lockValue === LOCK_TOKEN}`);
+  } catch (e) {
+    console.error(`🔬 [406 DIAGNOSTICS] redis_check_failed: ${e.message}`);
+  }
+}
+
+// --- Build a fresh TelegramClient (never reuse a destroyed one) ---
+function buildClient() {
+  return new TelegramClient(
+    new StringSession(RAW_SESSION_STRING),
+    API_ID,
+    API_HASH,
+    {
+      connectionRetries: 3,
+      autoReconnect: false, // OFF until post-getMe
+      useWSS: true,
+      floodSleepThreshold: 60,
+    }
+  );
+}
+
 // --- Graceful Shutdown ---
 async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   console.log(`\n🛑 ${signal} received — starting graceful shutdown...`);
 
-  // 1. Clear intervals
   if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
   if (lockRefreshInterval) { clearInterval(lockRefreshInterval); lockRefreshInterval = null; }
 
-  // 2. Disconnect Telegram client with timeout
   if (activeClient) {
     try {
       console.log('🔌 Disconnecting Telegram client...');
@@ -159,7 +197,6 @@ async function gracefulShutdown(signal) {
     }
   }
 
-  // 3. Release Redis lock
   try {
     const released = await withTimeout(
       redis.eval(RELEASE_LOCK_SCRIPT, 1, LOCK_KEY, LOCK_TOKEN),
@@ -171,7 +208,6 @@ async function gracefulShutdown(signal) {
     console.warn(`⚠️ Lock release failed: ${e.message}`);
   }
 
-  // 4. Quit Redis
   try {
     console.log('📤 Closing Redis connection...');
     await withTimeout(redis.quit(), 5000, 'redis.quit');
@@ -190,13 +226,11 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // --- Helpers ---
 
-/** Extract text from message, handling captions on media posts */
 function extractMessageText(message) {
   const text = message.message || message.text || message.rawText || '';
   return text.trim();
 }
 
-/** Resolve message to a full numeric chat ID (with -100 prefix) safely */
 function resolvePeerId(msg) {
   const peerId = msg.peerId;
   if (peerId) {
@@ -212,7 +246,6 @@ function resolvePeerId(msg) {
   return null;
 }
 
-/** Fetch and cache room metadata (name + avatar) in a single getEntity call */
 async function getRoomMeta(client, peerId, roomId) {
   if (roomMetaCache.has(roomId)) return roomMetaCache.get(roomId);
   let meta = { name: 'Alpha Room', avatar: null };
@@ -236,9 +269,9 @@ async function getRoomMeta(client, peerId, roomId) {
   return meta;
 }
 
-// --- Core message routing logic (shared by both handlers) ---
+// --- Core message routing logic ---
 async function routeMessage(client, msg, source) {
-  if (isShuttingDown) return; // Don't route during shutdown
+  if (isShuttingDown) return;
 
   const fullId = resolvePeerId(msg);
 
@@ -250,9 +283,8 @@ async function routeMessage(client, msg, source) {
   const isTargetRoom = TARGET_ROOMS.includes(fullId);
   const isNewsRoom = NEWS_ROOMS.includes(fullId);
 
-  if (!isTargetRoom && !isNewsRoom) return; // untracked — silent skip
+  if (!isTargetRoom && !isNewsRoom) return;
 
-  // Dedup check using unique message ID per room
   const dedupKey = `${fullId}:${msg.id}`;
   if (isDuplicate(dedupKey)) {
     console.log(`⏭️ [${source}] DEDUP | room=${fullId} msgId=${msg.id}`);
@@ -265,7 +297,6 @@ async function routeMessage(client, msg, source) {
 
   console.log(`📨 [${source}] Event | room=${fullId} target=${isTargetRoom} news=${isNewsRoom} media=${hasMedia} textLen=${messageText.length} CAs=${foundCAs ? foundCAs.length : 0}`);
 
-  // CA-first routing: CA found in a target room → alpha call
   if (foundCAs && isTargetRoom) {
     const contractAddress = foundCAs[0];
     const { name: roomName, avatar: roomAvatar } = await getRoomMeta(client, msg.peerId, fullId);
@@ -285,10 +316,7 @@ async function routeMessage(client, msg, source) {
 
     fetch(SUPABASE_EDGE_URL, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': RERAISE_EDGE_SECRET
-      },
+      headers: { 'Content-Type': 'application/json', 'x-api-key': RERAISE_EDGE_SECRET },
       body: JSON.stringify(payload)
     }).then(res => {
       if (!res.ok) res.text().then(t => console.error(`❌ Edge POST failed (alpha): ${res.status} ${t.substring(0, 200)}`));
@@ -297,7 +325,6 @@ async function routeMessage(client, msg, source) {
     return;
   }
 
-  // News routing: news room + has text
   if (isNewsRoom && messageText.length > 0) {
     const { name: roomName, avatar: roomAvatar } = await getRoomMeta(client, msg.peerId, fullId);
 
@@ -316,10 +343,7 @@ async function routeMessage(client, msg, source) {
 
     fetch(SUPABASE_EDGE_URL_NEWS, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': RERAISE_EDGE_SECRET
-      },
+      headers: { 'Content-Type': 'application/json', 'x-api-key': RERAISE_EDGE_SECRET },
       body: JSON.stringify(payload)
     }).then(res => {
       if (!res.ok) res.text().then(t => console.error(`❌ Edge POST failed (news): ${res.status} ${t.substring(0, 200)}`));
@@ -329,7 +353,6 @@ async function routeMessage(client, msg, source) {
     return;
   }
 
-  // Dropped — log reason
   if (messageText.length === 0) {
     console.log(`⏭️ [${source}] DROP:empty_text | room=${fullId} media=${hasMedia}`);
   } else {
@@ -341,12 +364,10 @@ async function routeMessage(client, msg, source) {
 function extractMessageUpdates(update) {
   const className = update.className;
 
-  // Direct message updates
   if (className === 'UpdateNewChannelMessage' || className === 'UpdateNewMessage') {
     return [update];
   }
 
-  // Container updates (Updates, UpdatesCombined) — iterate nested updates array
   if (className === 'Updates' || className === 'UpdatesCombined') {
     const nested = update.updates || [];
     const msgUpdates = nested.filter(u =>
@@ -358,7 +379,6 @@ function extractMessageUpdates(update) {
     return msgUpdates;
   }
 
-  // UpdateShort with message
   if (className === 'UpdateShort' && update.update) {
     const inner = update.update;
     if (inner.className === 'UpdateNewChannelMessage' || inner.className === 'UpdateNewMessage') {
@@ -367,7 +387,6 @@ function extractMessageUpdates(update) {
     }
   }
 
-  // UpdateShortMessage / UpdateShortChatMessage — compact format (good hygiene, low-risk)
   if (className === 'UpdateShortMessage' || className === 'UpdateShortChatMessage') {
     console.log(`📦 [RAW] ${className} → constructing synthetic message (id=${update.id})`);
     return [{
@@ -404,23 +423,16 @@ async function validateRooms(client) {
 // --- Main ---
 (async () => {
   try {
-  // Validate environment before connecting
   validateEnv();
-
-  const client = new TelegramClient(STRING_SESSION, API_ID, API_HASH, {
-    connectionRetries: 5,
-    autoReconnect: true,
-    useWSS: true,
-    floodSleepThreshold: 60,
-  });
-  activeClient = client;
 
   // --- Acquire Redis singleton lock ---
   console.log(`🔒 Acquiring scraper lock (key=${LOCK_KEY}, token=${LOCK_TOKEN})...`);
   const lockAcquired = await redis.set(LOCK_KEY, LOCK_TOKEN, 'NX', 'EX', LOCK_TTL);
   if (!lockAcquired) {
     const currentHolder = await redis.get(LOCK_KEY);
-    console.error(`🛑 FATAL: Lock already held by: ${currentHolder}`);
+    const holderTTL = await redis.ttl(LOCK_KEY);
+    console.error(`🛑 FATAL: Lock already held by: ${currentHolder} (TTL=${holderTTL}s)`);
+    console.error(`🛑 Our token: ${LOCK_TOKEN}`);
     console.error(`🛑 Another scraper instance is running. Exiting to prevent AUTH_KEY_DUPLICATED.`);
     await redis.quit();
     process.exit(1);
@@ -440,43 +452,79 @@ async function validateRooms(client) {
     }
   }, LOCK_REFRESH_INTERVAL);
 
-  // Retry connect with backoff to handle AUTH_KEY_DUPLICATED (406)
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  // --- Hardened bootstrap: fresh client per attempt, slow backoff, circuit breaker ---
+  let client = null;
+  let connected = false;
+
+  for (let attempt = 0; attempt < AUTH_DUPE_BACKOFFS_MS.length; attempt++) {
+    // Build a FRESH client each attempt (never reuse destroyed instances)
+    client = buildClient();
+    activeClient = client;
+
     try {
+      console.log(`🔌 Connect attempt ${attempt + 1}/${AUTH_DUPE_BACKOFFS_MS.length}...`);
       await client.connect();
       console.log("🟢 Reraise Scraper Online");
+      connected = true;
       break;
     } catch (e) {
       const isAuthDupe = e.message?.includes('AUTH_KEY_DUPLICATED') || e.code === 406;
-      if (isAuthDupe && attempt < 5) {
-        const wait = attempt * 5;
-        console.warn(`⚠️ AUTH_KEY_DUPLICATED on attempt ${attempt}/5 — disconnecting & retrying in ${wait}s...`);
-        // Force cleanup before retry
-        try { await withTimeout(client.disconnect(), 5000, 'disconnect-before-retry'); } catch (_) {}
-        try { client.destroy(); } catch (_) {}
-        await delay(wait * 1000);
+
+      // Log full diagnostics on every 406
+      if (isAuthDupe) {
+        await log406Diagnostics(attempt + 1);
+      }
+
+      // Force cleanup this client
+      try { await withTimeout(client.disconnect(), 5000, 'disconnect-cleanup'); } catch (_) {}
+      try { client.destroy(); } catch (_) {}
+      activeClient = null;
+
+      if (isAuthDupe && attempt < AUTH_DUPE_BACKOFFS_MS.length - 1) {
+        const waitMs = AUTH_DUPE_BACKOFFS_MS[attempt];
+        console.warn(`⚠️ AUTH_KEY_DUPLICATED on attempt ${attempt + 1}/${AUTH_DUPE_BACKOFFS_MS.length} — waiting ${waitMs / 1000}s before fresh client...`);
+        await delay(waitMs);
+      } else if (isAuthDupe) {
+        // Circuit breaker: last attempt failed, release lock and exit
+        console.error(`🛑 CIRCUIT BREAKER: All ${AUTH_DUPE_BACKOFFS_MS.length} connect attempts failed with AUTH_KEY_DUPLICATED.`);
+        console.error(`🛑 ACTION REQUIRED: 1) Stop ALL instances 2) Wait 120s 3) If still failing, regenerate STRING_SESSION`);
+        try { await redis.eval(RELEASE_LOCK_SCRIPT, 1, LOCK_KEY, LOCK_TOKEN); } catch (_) {}
+        try { await redis.quit(); } catch (_) {}
+        process.exit(1);
       } else {
-        throw e;
+        throw e; // non-406 error — bubble up
       }
     }
   }
 
-  // Connection health check — fastest possible RPC call
+  if (!connected) {
+    console.error('💀 FATAL: Failed to connect after all attempts');
+    process.exit(1);
+  }
+
+  // --- Post-connect: enable autoReconnect now that handshake succeeded ---
+  client.autoReconnect = true;
+  console.log('🔄 autoReconnect enabled (post-handshake)');
+
+  // Connection health check
   console.log("🏥 Connection health check...");
   try {
     const me = await withTimeout(client.getMe(), 15000, 'getMe');
     console.log(`✅ Authenticated as: ${me.username || me.firstName} (id: ${me.id})`);
   } catch (e) {
     console.warn(`⚠️ getMe failed: ${e.message} — attempting one reconnect cycle...`);
-    // One controlled reconnect before fatal exit
     try {
       await withTimeout(client.disconnect(), 5000, 'disconnect-for-reconnect');
     } catch (_) {}
-    await delay(3000);
+    await delay(5000);
     try {
+      // Build fresh client for reconnect
+      client = buildClient();
+      activeClient = client;
       await client.connect();
       const me = await withTimeout(client.getMe(), 15000, 'getMe-retry');
       console.log(`✅ Authenticated on retry: ${me.username || me.firstName} (id: ${me.id})`);
+      client.autoReconnect = true;
     } catch (e2) {
       console.error(`💀 FATAL: Cannot execute API calls after reconnect — connection is broken: ${e2.message}`);
       console.error(`💀 Either the session needs regeneration or the network is blocking MTProto RPC.`);
@@ -484,7 +532,7 @@ async function validateRooms(client) {
     }
   }
 
-  // Force GramJS to hydrate internal channel state (pts) — graceful degradation
+  // Force GramJS to hydrate internal channel state
   console.log("📡 Hydrating channel state...");
   let dialogHydrated = false;
   try {
@@ -496,7 +544,7 @@ async function validateRooms(client) {
   }
   console.log(`📡 Startup mode: ${dialogHydrated ? 'full hydration' : 'poll-fallback-only (dialog hydration skipped)'}`);
 
-  // Force entity hydration for ALL tracked rooms (critical for broadcast channels)
+  // Force entity hydration for ALL tracked rooms
   console.log("🔑 Force-hydrating entity cache for all tracked rooms...");
   for (const roomId of ALL_TRACKED_IDS) {
     try {
@@ -515,7 +563,7 @@ async function validateRooms(client) {
     console.error("⚠️ validateRooms failed (non-fatal):", e.message);
   }
 
-  // Cache resolved InputPeer entities for news rooms (prevents AUTH_KEY_DUPLICATED)
+  // Cache resolved InputPeer entities for news rooms
   console.log("🔑 Caching InputPeer entities for news rooms...");
   for (const roomId of NEWS_ROOMS) {
     try {
@@ -539,7 +587,6 @@ async function validateRooms(client) {
         console.log(`  📌 Seeded lastSeenNewsId for ${roomId}: ${msgs[0].id}`);
       }
     } catch (e) {
-      // Retry once after 2s for AUTH_KEY_DUPLICATED
       console.warn(`  ⚠️ Seed failed for ${roomId}, retrying in 2s: ${e.message}`);
       await delay(2000);
       try {
@@ -563,7 +610,7 @@ async function validateRooms(client) {
     }
   });
 
-  // --- Handler 1: Standard NewMessage (works for supergroups / alpha rooms) ---
+  // --- Handler 1: Standard NewMessage ---
   client.addEventHandler(async (event) => {
     try {
       await routeMessage(client, event.message, 'NM');
@@ -572,11 +619,10 @@ async function validateRooms(client) {
     }
   }, new NewMessage({}));
 
-  // --- Handler 2: Raw update handler (catches broadcast channel messages that NewMessage drops) ---
+  // --- Handler 2: Raw update handler ---
   const NOISY_UPDATES = new Set(['UpdateReadChannelInbox', 'UpdateReadHistoryInbox', 'UpdateUserStatus', 'UpdateChannelReadMessagesContents', 'UpdateReadChannelDiscussionInbox', 'UpdateDeleteChannelMessages', 'UpdateEditChannelMessage', 'UpdateEditMessage', 'UpdateMessagePoll', 'UpdateMessagePollVote', 'UpdateDraftMessage', 'UpdateWebPage', 'UpdateNotifySettings', 'UpdatePeerSettings', 'UpdateMessageReactions']);
   client.addEventHandler(async (update) => {
     try {
-      // Diagnostic: log non-noisy update classNames
       if (update.className && !NOISY_UPDATES.has(update.className)) {
         console.log(`🔍 [RAW] Received: ${update.className}`);
       }
@@ -591,7 +637,7 @@ async function validateRooms(client) {
     }
   });
 
-  // --- Poll Fallback + Interest Keepalive for broadcast channel news ---
+  // --- Poll Fallback for broadcast channel news ---
   if (NEWS_ROOMS.length > 0) {
     console.log(`🔄 Starting news poll fallback for ${NEWS_ROOMS.length} news room(s)`);
     pollInterval = setInterval(async () => {
@@ -607,9 +653,8 @@ async function validateRooms(client) {
           const msgs = await client.getMessages(peer, { limit: 20 });
           const lastSeen = lastSeenNewsId.get(roomId) || 0;
           const newMsgs = msgs.filter(m => m.id > lastSeen);
-          newMsgs.sort((a, b) => a.id - b.id); // oldest first — chronological routing
+          newMsgs.sort((a, b) => a.id - b.id);
 
-          // Set lastSeenNewsId BEFORE routing to prevent race condition
           if (msgs.length > 0) {
             lastSeenNewsId.set(roomId, Math.max(...msgs.map(m => m.id)));
           }
@@ -622,7 +667,6 @@ async function validateRooms(client) {
           roomsChecked++;
           totalNewMsgs += newMsgs.length;
         } catch (e) {
-          // Retry once after 2s for transient MTProto errors
           console.warn(`⚠️ Poll fallback failed for ${roomId}: ${e.message}, retrying in 2s...`);
           await delay(2000);
           try {
@@ -630,8 +674,7 @@ async function validateRooms(client) {
             const msgs = await client.getMessages(peer, { limit: 20 });
             const lastSeen = lastSeenNewsId.get(roomId) || 0;
             const newMsgs = msgs.filter(m => m.id > lastSeen);
-            newMsgs.sort((a, b) => a.id - b.id); // oldest first
-            // Set lastSeenNewsId BEFORE routing to prevent race condition
+            newMsgs.sort((a, b) => a.id - b.id);
             if (msgs.length > 0) {
               lastSeenNewsId.set(roomId, Math.max(...msgs.map(m => m.id)));
             }
@@ -656,7 +699,6 @@ async function validateRooms(client) {
   } catch (err) {
     console.error("💀 FATAL: Startup crashed:", err);
     try { await activeClient?.disconnect(); } catch (_) {}
-    // Release lock on crash
     try { await redis.eval(RELEASE_LOCK_SCRIPT, 1, LOCK_KEY, LOCK_TOKEN); } catch (_) {}
     try { await redis.quit(); } catch (_) {}
     process.exit(1);
