@@ -306,8 +306,23 @@ async function validateRooms(client) {
     useWSS: true,
   });
 
-  await client.connect();
-  console.log("🟢 Reraise Scraper Online");
+  // Retry connect with backoff to handle AUTH_KEY_DUPLICATED (406)
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      await client.connect();
+      console.log("🟢 Reraise Scraper Online");
+      break;
+    } catch (e) {
+      const isAuthDupe = e.message?.includes('AUTH_KEY_DUPLICATED') || e.code === 406;
+      if (isAuthDupe && attempt < 5) {
+        const wait = attempt * 5;
+        console.warn(`⚠️ AUTH_KEY_DUPLICATED on attempt ${attempt}/5 — retrying in ${wait}s...`);
+        await delay(wait * 1000);
+      } else {
+        throw e;
+      }
+    }
+  }
 
   // Force GramJS to hydrate internal channel state (pts)
   console.log("📡 Hydrating channel state...");
@@ -468,6 +483,7 @@ async function validateRooms(client) {
   console.log(`👂 Listening via NewMessage + Raw handler, filtering for ${ALL_TRACKED_IDS.length} tracked ID(s)`);
   } catch (err) {
     console.error("💀 FATAL: Startup crashed:", err);
+    try { await client.disconnect(); } catch (_) {}
     process.exit(1);
   }
 })();
