@@ -16,9 +16,16 @@ const API_ID = parseInt(process.env.TELEGRAM_API_ID);
 const API_HASH = process.env.TELEGRAM_API_HASH;
 const STRING_SESSION = new StringSession(process.env.TELEGRAM_STRING_SESSION);
 const TARGET_ROOMS = process.env.TARGET_ROOM_IDS.split(',').map(s => Number(s.trim()));
-const NEWS_ROOMS = process.env.NEWS_ROOM_IDS
-  ? process.env.NEWS_ROOM_IDS.split(',').map(s => Number(s.trim()))
+const NEWS_ROOMS_RAW = process.env.NEWS_ROOM_IDS
+  ? process.env.NEWS_ROOM_IDS.split(',').map(s => s.trim()).filter(Boolean)
   : [];
+const NEWS_ROOMS = NEWS_ROOMS_RAW.map(s => {
+  const n = Number(s);
+  // Ensure every channel ID has the -100 prefix
+  if (n > 0) return Number(`-100${n}`);
+  if (n < 0 && !String(n).startsWith('-100')) return Number(`-100${String(n).slice(1)}`);
+  return n;
+});
 const SUPABASE_EDGE_URL = process.env.SUPABASE_EDGE_URL;
 const SUPABASE_EDGE_URL_NEWS = process.env.SUPABASE_EDGE_URL_NEWS;
 const RERAISE_EDGE_SECRET = process.env.RERAISE_EDGE_SECRET;
@@ -36,7 +43,8 @@ function validateEnv() {
   if (badNews.length) console.error(`  ❌ NEWS_ROOM_IDS contains NaN values: ${JSON.stringify(badNews)}`);
 
   console.log(`  📋 TARGET_ROOMS (${TARGET_ROOMS.length}): ${JSON.stringify(TARGET_ROOMS)}`);
-  console.log(`  📋 NEWS_ROOMS   (${NEWS_ROOMS.length}): ${JSON.stringify(NEWS_ROOMS)}`);
+  console.log(`  📋 NEWS_ROOMS_RAW: ${JSON.stringify(NEWS_ROOMS_RAW)}`);
+  console.log(`  📋 NEWS_ROOMS (normalized, ${NEWS_ROOMS.length}): ${JSON.stringify(NEWS_ROOMS)}`);
 
   if (!SUPABASE_EDGE_URL) console.error("  ❌ SUPABASE_EDGE_URL is missing!");
   else console.log(`  ✅ SUPABASE_EDGE_URL: ${SUPABASE_EDGE_URL}`);
@@ -400,12 +408,17 @@ async function validateRooms(client) {
   if (NEWS_ROOMS.length > 0) {
     console.log(`🔄 Starting news poll fallback for ${NEWS_ROOMS.length} news room(s)`);
     setInterval(async () => {
+      let roomsChecked = 0;
+      let totalNewMsgs = 0;
+
       for (const roomId of NEWS_ROOMS) {
         try {
           const peer = newsEntityCache.get(roomId) || roomId;
-          const msgs = await client.getMessages(peer, { limit: 5 });
+          const msgs = await client.getMessages(peer, { limit: 20 });
           const lastSeen = lastSeenNewsId.get(roomId) || 0;
           const newMsgs = msgs.filter(m => m.id > lastSeen);
+          newMsgs.sort((a, b) => a.id - b.id); // oldest first — chronological routing
+
           if (newMsgs.length > 0) {
             console.log(`📬 [POLL] ${newMsgs.length} new message(s) in room ${roomId} (lastSeen=${lastSeen})`);
           }
@@ -415,28 +428,35 @@ async function validateRooms(client) {
           if (msgs.length > 0) {
             lastSeenNewsId.set(roomId, Math.max(...msgs.map(m => m.id)));
           }
+          roomsChecked++;
+          totalNewMsgs += newMsgs.length;
         } catch (e) {
           // Retry once after 2s for transient MTProto errors
           console.warn(`⚠️ Poll fallback failed for ${roomId}: ${e.message}, retrying in 2s...`);
           await delay(2000);
           try {
             const peer = newsEntityCache.get(roomId) || roomId;
-            const msgs = await client.getMessages(peer, { limit: 5 });
+            const msgs = await client.getMessages(peer, { limit: 20 });
             const lastSeen = lastSeenNewsId.get(roomId) || 0;
             const newMsgs = msgs.filter(m => m.id > lastSeen);
+            newMsgs.sort((a, b) => a.id - b.id); // oldest first
             for (const msg of newMsgs) {
               await routeMessage(client, msg, 'POLL');
             }
             if (msgs.length > 0) {
               lastSeenNewsId.set(roomId, Math.max(...msgs.map(m => m.id)));
             }
+            roomsChecked++;
+            totalNewMsgs += newMsgs.length;
           } catch (e2) {
             console.warn(`⚠️ Poll retry also failed for ${roomId}: ${e2.message}`);
           }
         }
         await delay(500);
       }
-    }, 30_000);
+
+      console.log(`💓 POLL: Checked ${roomsChecked}/${NEWS_ROOMS.length} rooms, found ${totalNewMsgs} new messages`);
+    }, 10_000);
   }
 
   console.log(`👂 Listening via NewMessage + Raw handler, filtering for ${ALL_TRACKED_IDS.length} tracked ID(s)`);
