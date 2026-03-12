@@ -56,6 +56,9 @@ redis.on('reconnecting', () => console.warn('🟡 Redis reconnecting...'));
 // Avatar cache
 const avatarCache = new Map();
 
+// Poll fallback: track last seen message ID per news room
+const lastSeenNewsId = new Map();
+
 // --- Deduplication ---
 const processedMsgIds = new Set();
 const DEDUP_MAX_SIZE = 5000;
@@ -305,6 +308,20 @@ async function validateRooms(client) {
   // Validate all rooms on startup
   await validateRooms(client);
 
+  // Seed lastSeenNewsId so poll fallback only processes future messages
+  console.log("📌 Seeding lastSeenNewsId for news rooms...");
+  for (const roomId of NEWS_ROOMS) {
+    try {
+      const msgs = await client.getMessages(roomId, { limit: 1 });
+      if (msgs.length > 0) {
+        lastSeenNewsId.set(roomId, msgs[0].id);
+        console.log(`  📌 Seeded lastSeenNewsId for ${roomId}: ${msgs[0].id}`);
+      }
+    } catch (e) {
+      console.warn(`  ⚠️ Failed to seed lastSeenNewsId for ${roomId}: ${e.message}`);
+    }
+  }
+
   // Connection health
   client.addEventHandler((update) => {
     if (update.className === 'UpdateConnectionState') {
@@ -340,15 +357,26 @@ async function validateRooms(client) {
     }
   });
 
-  // --- Interest Keepalive: Prevent Telegram from throttling broadcast channel updates ---
+  // --- Poll Fallback + Interest Keepalive for broadcast channel news ---
   if (NEWS_ROOMS.length > 0) {
-    console.log(`🔄 Starting interest keepalive for ${NEWS_ROOMS.length} news room(s)`);
+    console.log(`🔄 Starting news poll fallback for ${NEWS_ROOMS.length} news room(s)`);
     setInterval(async () => {
       for (const roomId of NEWS_ROOMS) {
         try {
-          await client.getMessages(roomId, { limit: 1 });
+          const msgs = await client.getMessages(roomId, { limit: 5 });
+          const lastSeen = lastSeenNewsId.get(roomId) || 0;
+          const newMsgs = msgs.filter(m => m.id > lastSeen);
+          if (newMsgs.length > 0) {
+            console.log(`📬 [POLL] ${newMsgs.length} new message(s) in room ${roomId} (lastSeen=${lastSeen})`);
+          }
+          for (const msg of newMsgs) {
+            await routeMessage(client, msg, 'POLL');
+          }
+          if (msgs.length > 0) {
+            lastSeenNewsId.set(roomId, Math.max(...msgs.map(m => m.id)));
+          }
         } catch (e) {
-          console.warn(`⚠️ Keepalive failed for ${roomId}:`, e.message);
+          console.warn(`⚠️ Poll fallback failed for ${roomId}:`, e.message);
         }
       }
     }, 30_000);
