@@ -2,6 +2,13 @@ const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { NewMessage } = require("telegram/events");
 
+// Global safety net — prevent transient MTProto errors from crashing the process
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️ Unhandled rejection (non-fatal):', reason?.message || reason);
+});
+
+const delay = ms => new Promise(r => setTimeout(r, ms));
+
 const Redis = require("ioredis");
 
 // --- Configuration via Environment Variables ---
@@ -287,6 +294,7 @@ async function validateRooms(client) {
   const client = new TelegramClient(STRING_SESSION, API_ID, API_HASH, {
     connectionRetries: 5,
     autoReconnect: true,
+    useWSS: true,
   });
 
   await client.connect();
@@ -306,6 +314,7 @@ async function validateRooms(client) {
     } catch (e) {
       console.error(`  ❌ Failed to hydrate entity for ${roomId}: ${e.message}`);
     }
+    await delay(500);
   }
 
   // Validate all rooms on startup
@@ -321,6 +330,7 @@ async function validateRooms(client) {
     } catch (e) {
       console.error(`  ❌ Failed to cache InputPeer for ${roomId}: ${e.message}`);
     }
+    await delay(500);
   }
 
   // Seed lastSeenNewsId so poll fallback only processes future messages
@@ -334,8 +344,21 @@ async function validateRooms(client) {
         console.log(`  📌 Seeded lastSeenNewsId for ${roomId}: ${msgs[0].id}`);
       }
     } catch (e) {
-      console.warn(`  ⚠️ Failed to seed lastSeenNewsId for ${roomId}: ${e.message}`);
+      // Retry once after 2s for AUTH_KEY_DUPLICATED
+      console.warn(`  ⚠️ Seed failed for ${roomId}, retrying in 2s: ${e.message}`);
+      await delay(2000);
+      try {
+        const peer = newsEntityCache.get(roomId) || roomId;
+        const msgs = await client.getMessages(peer, { limit: 1 });
+        if (msgs.length > 0) {
+          lastSeenNewsId.set(roomId, msgs[0].id);
+          console.log(`  📌 Seeded lastSeenNewsId for ${roomId} (retry): ${msgs[0].id}`);
+        }
+      } catch (e2) {
+        console.warn(`  ⚠️ Seed retry also failed for ${roomId}: ${e2.message}`);
+      }
     }
+    await delay(500);
   }
 
   // Connection health
@@ -379,8 +402,8 @@ async function validateRooms(client) {
     setInterval(async () => {
       for (const roomId of NEWS_ROOMS) {
         try {
-        const peer = newsEntityCache.get(roomId) || roomId;
-        const msgs = await client.getMessages(peer, { limit: 5 });
+          const peer = newsEntityCache.get(roomId) || roomId;
+          const msgs = await client.getMessages(peer, { limit: 5 });
           const lastSeen = lastSeenNewsId.get(roomId) || 0;
           const newMsgs = msgs.filter(m => m.id > lastSeen);
           if (newMsgs.length > 0) {
@@ -393,8 +416,25 @@ async function validateRooms(client) {
             lastSeenNewsId.set(roomId, Math.max(...msgs.map(m => m.id)));
           }
         } catch (e) {
-          console.warn(`⚠️ Poll fallback failed for ${roomId}:`, e.message);
+          // Retry once after 2s for transient MTProto errors
+          console.warn(`⚠️ Poll fallback failed for ${roomId}: ${e.message}, retrying in 2s...`);
+          await delay(2000);
+          try {
+            const peer = newsEntityCache.get(roomId) || roomId;
+            const msgs = await client.getMessages(peer, { limit: 5 });
+            const lastSeen = lastSeenNewsId.get(roomId) || 0;
+            const newMsgs = msgs.filter(m => m.id > lastSeen);
+            for (const msg of newMsgs) {
+              await routeMessage(client, msg, 'POLL');
+            }
+            if (msgs.length > 0) {
+              lastSeenNewsId.set(roomId, Math.max(...msgs.map(m => m.id)));
+            }
+          } catch (e2) {
+            console.warn(`⚠️ Poll retry also failed for ${roomId}: ${e2.message}`);
+          }
         }
+        await delay(500);
       }
     }, 30_000);
   }
