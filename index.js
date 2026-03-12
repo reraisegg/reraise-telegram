@@ -322,6 +322,7 @@ async function validateRooms(client) {
     connectionRetries: 5,
     autoReconnect: true,
     useWSS: true,
+    floodSleepThreshold: 60,
   });
 
   // Retry connect with backoff to handle AUTH_KEY_DUPLICATED (406)
@@ -340,6 +341,17 @@ async function validateRooms(client) {
         throw e;
       }
     }
+  }
+
+  // Connection health check — fastest possible RPC call
+  console.log("🏥 Connection health check...");
+  try {
+    const me = await withTimeout(client.getMe(), 15000, 'getMe');
+    console.log(`✅ Authenticated as: ${me.username || me.firstName} (id: ${me.id})`);
+  } catch (e) {
+    console.error(`💀 FATAL: Cannot execute API calls — connection is broken: ${e.message}`);
+    console.error(`💀 Either the session needs regeneration or the network is blocking MTProto RPC.`);
+    process.exit(1);
   }
 
   // Force GramJS to hydrate internal channel state (pts) — graceful degradation
